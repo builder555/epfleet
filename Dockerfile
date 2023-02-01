@@ -1,48 +1,29 @@
-FROM balenalib/aarch64-debian-node:12.20-buster-build as builder
-
-RUN apt-get update
-RUN apt-get install python jq
-
-# install dependencies
-
-WORKDIR /usr/src/etcher
-
-COPY etcher/scripts scripts
-COPY etcher/typings typings
-COPY etcher/tsconfig.json etcher/npm-shrinkwrap.json etcher/package.json ./
-
-ENV npm_config_disturl=https://electronjs.org/headers
-ENV npm_config_runtime=electron
-RUN npm_config_target=$(jq .devDependencies.electron package.json) npm i
+FROM balenalib/aarch64-debian-node:14.17-bullseye-build as builder
+RUN install_packages p7zip-full git python gcc g++ ruby-dev make libx11-dev libxkbfile-dev fakeroot rpm libsecret-1-dev jq python2.7-dev python3-pip python-setuptools libudev-dev
 
 WORKDIR /usr/src/app
 
 COPY package.json package-lock.json ./
-RUN npm i
-
-# build sources
-
-WORKDIR /usr/src/etcher
-
-COPY etcher/assets assets
-COPY etcher/lib lib
-COPY etcher/tsconfig.webpack.json etcher/webpack.config.ts etcher/electron-builder.yml etcher/afterPack.js ./
-RUN npm run webpack
-RUN PATH=$(pwd)/node_modules/.bin/:$PATH electron-builder --dir --config.asar=false --config.npmRebuild=false --config.nodeGypRebuild=false
-
-WORKDIR /usr/src/app
-
 COPY tsconfig.json update-config-and-start.ts ./
-RUN npx tsc update-config-and-start.ts
+RUN npm i && npx tsc update-config-and-start.ts
+
+WORKDIR /usr/src/
+COPY build-etcher.sh ./build-etcher.sh
+#Ensure we clear the balena builder cache to fetch latest etcher
+ADD "https://api.github.com/repos/balena-io/etcher/commits?per_page=1" etcher_latest_commit
+RUN chmod +x ./build-etcher.sh && ./build-etcher.sh
+
+# runtime image
 
 FROM balenablocks/aarch64-balena-electron-env:v1.2.9
 COPY --from=builder /usr/src/etcher/dist/linux-arm64-unpacked/resources/app /usr/src/app
+COPY --from=builder /usr/src/etcher/generated /usr/src/app/generated
 COPY --from=builder /usr/src/etcher/node_modules/electron/ /usr/src/app/node_modules/electron
 
 WORKDIR /usr/src/app/node_modules/.bin
 RUN ln -s ../electron/cli.js electron
 
-RUN apt-get update && apt-get install exfat-fuse
+RUN apt-get update && apt-get install exfat-fuse lzma
 
 COPY zram.sh /usr/src/app/
 COPY screensaver_on.sh screensaver_off.sh /usr/bin/
@@ -54,7 +35,10 @@ RUN chmod +x /usr/bin/screensaver_on.sh
 COPY --from=builder /usr/src/app/update-config-and-start.js /usr/src/app
 
 WORKDIR /usr/src/app
+# correct .elf is part of etcher-sdk since 7.4.2
+#COPY start_cd.elf ./generated/modules/node-raspberrypi-usbboot/blobs/raspberrypi/start_cd.elf
 
 CMD \
-	./zram.sh \
+    curl -X POST --unix-socket $(echo ${DOCKER_HOST} | sed "s/unix:\/\///") http://localhost/images/prune\?dangling\=false \
+	&& ./zram.sh \
 	&& node /usr/src/app/update-config-and-start.js
